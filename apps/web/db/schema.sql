@@ -288,7 +288,7 @@ CREATE TABLE IF NOT EXISTS tg_coverage (
 );
 
 -- ── Annotations (append-only body) ──────────────────────────
-CREATE FUNCTION IF NOT EXISTS mz_append_only() RETURNS trigger LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION mz_append_only() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   RAISE EXCEPTION '% is append-only: corrections must be new revisions', TG_TABLE_NAME;
 END $$;

@@ -1,0 +1,35 @@
+# Environment & Secrets (Ground Rule 4)
+.env
+.env.*
+!.env.example
+*.local
+seed-accounts.local.md
+
+# Media & Data
+media-local/
+data/bundle.json
+public/mz/
+data/preview/
+
+# Dependencies & Build
+node_modules/
+.next/
+dist/
+build/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Terraform
+terraform/.terraform/
+terraform/*.tfstate*
+terraform/*.tfvars
+
+# Logs & temp
+*.log
+*.tmp

@@ -7,5 +7,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY mz_worker ./mz_worker
 RUN useradd -r -u 10001 worker
 USER worker
-STOP_SIGNAL SIGTERM
+STOPSIGNAL SIGTERM
 CMD ["python", "-m", "mz_worker"]
