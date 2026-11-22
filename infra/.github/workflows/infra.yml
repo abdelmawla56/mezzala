@@ -1,0 +1,47 @@
+# Place at <repo>/.github/workflows/infra.yml (workflow files only run from the repo root).
+# Not executed by the author: first run happens in your repo. Expect to adjust paths if infra/ lives elsewhere.
+name: infra
+on:
+  pull_request:
+    paths: ["infra/**", "apps/web/db/**"]
+  push:
+    branches: [main]
+jobs:
+  db-and-worker:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_PASSWORD: pg }
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      PGHOST: 127.0.0.1
+      PGUSER: postgres
+      PGPASSWORD: pg
+      MZ_TEST_SUPERUSER_PASSWORD: pg
+      DBMATE_VERSION: v2.38.1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Tools
+        run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg postgresql-client
+          curl -fsSL -o dbmate https://github.com/amacneil/dbmate/releases/download/${DBMATE_VERSION}/dbmate-linux-amd64
+          sudo install dbmate /usr/local/bin/dbmate
+          pip install -r infra/worker/requirements.txt pytest "moto[server]"
+      - name: Unit + integration tests (fixture baseline)
+        working-directory: infra
+        run: make test
+      - name: Migrations on the REAL schema, then RLS report
+        working-directory: infra
+        run: |
+          make baseline
+          createdb real_schema
+          MZ_APP_PASSWORD=ci MZ_WORKER_PASSWORD=ci ./scripts/create-roles.sh real_schema
+          DATABASE_URL="postgres://postgres:pg@127.0.0.1:5432/real_schema?sslmode=disable" DBMATE_NO_DUMP_SCHEMA=true dbmate up
+          # fail on any table that is neither tenant-scoped nor exempted with a reason
+          test "$(psql -d real_schema -Atc "SELECT count(*) FROM mz_rls_report WHERE status = 'UNTENANTED'")" = "0" \
+            || { psql -d real_schema -c "SELECT * FROM mz_rls_report WHERE status = 'UNTENANTED'"; exit 1; }
