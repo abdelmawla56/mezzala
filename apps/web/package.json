@@ -7,6 +7,8 @@
     "build": "next build",
     "start": "next start",
     "db:setup": "node scripts/db-migrate.mjs && node scripts/db-seed.mjs",
+    "check:rls": "node scripts/tenant-leak-check.mjs",
+    "check:all": "node scripts/tenant-leak-check.mjs && node scripts/tagging-check.mjs && node scripts/qa-ai-check.mjs && node scripts/video-check.mjs && node scripts/api-check.mjs",
     "test": "vitest run"
   },
   "dependencies": {
