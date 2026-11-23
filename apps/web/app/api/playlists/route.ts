@@ -7,7 +7,6 @@ export async function GET(req: Request) {
   try {
     const { clubId } = await getAuthContext(req);
 
-    // Defense in depth: RLS enforces club_id = mz_club(), and SQL explicitly filters by club_id = $1
     const rows = await withTenant(pool, clubId, async (c) => {
       const { rows } = await c.query(
         `SELECT id, club_id, name, created_at
@@ -21,7 +20,11 @@ export async function GET(req: Request) {
 
     return Response.json({ rows });
   } catch (err: any) {
-    const status = err.message?.includes("unauthorized") ? 403 : 400;
+    const status = err.message?.includes("UNAUTHORIZED")
+      ? 401
+      : err.message?.includes("FORBIDDEN")
+      ? 403
+      : 400;
     return Response.json({ error: err.message }, { status });
   }
 }

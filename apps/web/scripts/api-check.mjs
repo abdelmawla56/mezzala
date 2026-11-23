@@ -107,8 +107,8 @@ async function run() {
 
   // 4. Missing tenant / unauthenticated check
   const noClubPlaylists = await playlistsGET(new Request("http://localhost:3600/api/playlists"));
-  if (noClubPlaylists.status !== 400) throw new Error("Expected 400 on missing tenant");
-  console.log("PASS: Tenant requirement verified on /api/playlists");
+  if (noClubPlaylists.status !== 401) throw new Error(`Expected 401 on unauthenticated request, got ${noClubPlaylists.status}`);
+  console.log("PASS: Authentication requirement verified on /api/playlists (401 Unauthorized)");
 
   // 5. AI Tagging contract verification
   const aiGet = await aiGET(new Request("http://localhost:3600/api/ai-tagging"));

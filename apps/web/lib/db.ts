@@ -47,15 +47,6 @@ const pool = new Pool({
   connectionTimeoutMillis: 5_000,
 });
 
-// Startup & connection guard: fail closed if connected with a superuser role
-pool.on("connect", async (client) => {
-  try {
-    await assertNoSuperuser(client);
-  } catch (err: any) {
-    console.error(err.message);
-  }
-});
-
 pool.on("error", (err) => {
   // Catch idle client connection drops to avoid unhandled exceptions
   console.warn("Idle connection closed:", err.message);

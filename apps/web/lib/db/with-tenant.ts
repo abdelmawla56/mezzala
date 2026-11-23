@@ -15,22 +15,23 @@ export interface TenantUser {
 
 /**
  * Derives and validates the effective tenant ID for a request.
- * Enforces that user cannot access another tenant's data.
+ * Strictly requires an authenticated user with an assigned club_id.
+ * Rejects anonymous access and prevents tenant spoofing.
  */
 export function tenantFor(
   user?: TenantUser | null,
   requestedClubId?: string | null
 ): string {
-  if (user?.clubId) {
-    if (requestedClubId && requestedClubId !== user.clubId && user.role !== "superadmin") {
-      throw new Error(`tenantFor: unauthorized access to club '${requestedClubId}' by user of '${user.clubId}'`);
-    }
-    return user.clubId;
+  if (!user) {
+    throw new Error("UNAUTHORIZED: Authentication required");
   }
-  if (requestedClubId && (CLUBS as readonly string[]).includes(requestedClubId)) {
-    return requestedClubId;
+  if (!user.clubId) {
+    throw new Error("FORBIDDEN: User has no assigned club membership");
   }
-  throw new Error(`tenantFor: invalid or missing club id '${requestedClubId}'`);
+  if (requestedClubId && requestedClubId !== user.clubId && user.role !== "superadmin") {
+    throw new Error(`FORBIDDEN: User of '${user.clubId}' cannot access tenant '${requestedClubId}'`);
+  }
+  return user.clubId;
 }
 
 /**

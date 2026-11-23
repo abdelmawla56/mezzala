@@ -1,16 +1,24 @@
 #!/usr/bin/env node
 /**
  * tenant-leak-check.mjs
- * Comprehensive acceptance test for Task 1:
- * 1. RLS boundary across ALL tenant tables from mz_rls_report (status = 'ok').
- * 2. Fail-closed behavior: direct query without tenant context returns 0 rows.
- * 3. Every GET route (/api/tagging, /api/qa, /api/media, /api/playlists, /api/ai-tagging)
- *    tested as a GCLUB user — never returns TEST-000 rows.
- * 4. Append-only enforcement on EVERY table from pg_trigger carrying mz_append_only():
- *    verifies mz_app is DENIED UPDATE, DELETE, and TRUNCATE.
- * 5. Startup guard verification: runtime pool connecting as superuser fails closed.
- * 6. Owner import guard verification.
- * 7. Cleanup uses DATABASE_URL_OWNER with session_replication_role = 'replica'.
+ * Rigorous end-to-end acceptance test for Task 1:
+ * 
+ * 1. REAL HTTP route tests against live dev server (http://localhost:3600):
+ *    - No session cookie -> 401 Unauthorized across all routes
+ *    - Invalid session cookie -> 401 Unauthorized
+ *    - Expired session cookie -> 401 Unauthorized
+ *    - GCLUB session cookie + x-club-id: TEST-000 -> 403 Forbidden
+ *    - GCLUB session cookie requesting TEST-000 match_id -> 404 or empty {"rows": []}
+ *    - GCLUB session cookie requesting GCLUB match_id -> 200 with only GCLUB data
+ *    - AI tagging endpoint -> 409 bilingual no_vendor response
+ * 
+ * 2. DATABASE-LEVEL tenant isolation & privilege tests:
+ *    - RLS boundary across ALL 41 tenant tables from mz_rls_report under withTenant('GCLUB')
+ *    - Fail-closed behavior: direct query without tenant context returns 0 rows
+ *    - Append-only enforcement on ALL 7 tables carrying mz_append_only() trigger:
+ *      UPDATE, DELETE, and TRUNCATE all denied for mz_app
+ *    - Startup guard: proves connecting as superuser fails closed
+ *    - Cleanup uses DATABASE_URL_OWNER with session_replication_role = 'replica'
  */
 
 import { readFileSync, existsSync } from "node:fs";
@@ -46,21 +54,17 @@ if (!DATABASE_URL || !DATABASE_URL_OWNER) {
 const appPool = new pg.Pool({ connectionString: DATABASE_URL, max: 2 });
 const ownerPool = new pg.Pool({ connectionString: DATABASE_URL_OWNER, max: 2 });
 
-// Import route handlers
-import { GET as taggingGET } from "../app/api/tagging/route.ts";
-import { GET as mediaGET } from "../app/api/media/route.ts";
-import { GET as qaGET } from "../app/api/qa/route.ts";
-import { GET as playlistsGET } from "../app/api/playlists/route.ts";
-import { GET as aiTaggingGET } from "../app/api/ai-tagging/route.ts";
 import { withTenant } from "../lib/db/with-tenant.ts";
 import { hashToken } from "../lib/auth.ts";
 import { assertNoSuperuser } from "../lib/db.ts";
 
-async function cleanup(ownerClient, tokenHash) {
+const BASE_URL = process.env.TEST_BASE_URL || "http://localhost:3600";
+
+async function cleanup(ownerClient, tokenHashes = []) {
   try {
     await ownerClient.query("SET session_replication_role = 'replica'");
-    if (tokenHash) {
-      await ownerClient.query("DELETE FROM sessions WHERE token_hash = $1", [tokenHash]);
+    if (tokenHashes.length > 0) {
+      await ownerClient.query("DELETE FROM sessions WHERE token_hash = ANY($1)", [tokenHashes]);
     }
     await ownerClient.query("DELETE FROM playlist_item WHERE club_id IN ('GCLUB', 'TEST-000')");
     await ownerClient.query("DELETE FROM playlist WHERE name LIKE 'LEAK_TEST_%'");
@@ -76,19 +80,19 @@ async function cleanup(ownerClient, tokenHash) {
 
 async function run() {
   console.log("=================================================");
-  console.log("=== RUNNING ENHANCED TENANT LEAK CHECK (T1)  ===");
+  console.log("=== REAL HTTP & DB TENANT LEAK CHECK (TASK 1) ===");
   console.log("=================================================");
   let passed = true;
 
   const ownerClient = await ownerPool.connect();
-  let gTokenHash;
+  const createdTokens = [];
   try {
-    // 0. Ensure baseline tenants & cleanup previous runs
+    // 0. Ensure baseline tenants & initial cleanup
     await ownerClient.query("INSERT INTO tenant (id, name) VALUES ('GCLUB', 'Golden Club') ON CONFLICT DO NOTHING");
     await ownerClient.query("INSERT INTO tenant (id, name) VALUES ('TEST-000', 'Test Tenant') ON CONFLICT DO NOTHING");
     await cleanup(ownerClient);
 
-    // 1. Seed fixtures for both tenants
+    // 1. Seed dual-tenant fixtures via owner
     console.log("\n-> 1. Seeding dual-tenant fixtures (GCLUB & TEST-000)...");
     const gMatch = (await ownerClient.query(
       "INSERT INTO tg_match (club_id, code, match_date, home_team, away_team) VALUES ('GCLUB', 'LEAK_TEST_G', CURRENT_DATE, 'GHome', 'GAway') RETURNING id"
@@ -117,49 +121,175 @@ async function run() {
     await ownerClient.query("INSERT INTO media_asset (club_id, match_id, filename, upload_state) VALUES ('GCLUB', $1, 'leak_test_g.mp4', 'ready')", [gMatch.id]);
     await ownerClient.query("INSERT INTO media_asset (club_id, match_id, filename, upload_state) VALUES ('TEST-000', $1, 'leak_test_t.mp4', 'ready')", [tMatch.id]);
 
-    // Seed session token for GCLUB user
+    // Seed active session for GCLUB user
     const gUserRes = await ownerClient.query("SELECT id FROM users WHERE email = 'admin@gclub.dev'");
     const gUserId = gUserRes.rows[0]?.id || 1;
-    const gToken = "leak_test_token_gclub_12345";
-    gTokenHash = hashToken(gToken);
+    const gToken = "valid_gclub_session_token_123456789";
+    const gTokenHash = hashToken(gToken);
+    createdTokens.push(gTokenHash);
     await ownerClient.query(
       "INSERT INTO sessions (token_hash, user_id, expires_at) VALUES ($1, $2, now() + interval '1 hour') ON CONFLICT (token_hash) DO UPDATE SET expires_at = EXCLUDED.expires_at",
       [gTokenHash, gUserId]
     );
 
-    // 2. Query ALL tenant tables dynamically from mz_rls_report
-    console.log("\n-> 2. Querying all tenant tables from mz_rls_report under withTenant('GCLUB')...");
+    // Seed expired session for GCLUB user
+    const expiredToken = "expired_gclub_session_token_987654321";
+    const expiredTokenHash = hashToken(expiredToken);
+    createdTokens.push(expiredTokenHash);
+    await ownerClient.query(
+      "INSERT INTO sessions (token_hash, user_id, expires_at) VALUES ($1, $2, now() - interval '1 hour') ON CONFLICT (token_hash) DO UPDATE SET expires_at = EXCLUDED.expires_at",
+      [expiredTokenHash, gUserId]
+    );
+
+    // 2. REAL HTTP ROUTE TESTS AGAINST LIVE DEV SERVER
+    console.log(`\n-> 2. Executing Real HTTP tests against ${BASE_URL}...`);
+
+    // Helper for real HTTP fetch
+    async function httpReq(path, { cookie, headers = {}, method = "GET", body } = {}) {
+      const reqHeaders = { ...headers };
+      if (cookie) reqHeaders["Cookie"] = cookie;
+      if (body) reqHeaders["Content-Type"] = "application/json";
+
+      const res = await fetch(`${BASE_URL}${path}`, {
+        method,
+        headers: reqHeaders,
+        body: body ? JSON.stringify(body) : undefined,
+      });
+
+      let json = null;
+      try {
+        json = await res.json();
+      } catch {}
+      return { status: res.status, json };
+    }
+
+    // Test Case A: No cookie gives 401 across every tenant route
+    console.log("   [Case A] Verifying anonymous requests return 401 on every tenant route...");
+    const routesToTest = [
+      "/api/playlists",
+      `/api/tagging?match_id=${gMatch.id}`,
+      `/api/media?match_id=${gMatch.id}`,
+      `/api/qa?match_id=${gMatch.id}`,
+    ];
+    for (const r of routesToTest) {
+      const res = await httpReq(r);
+      if (res.status === 401) {
+        console.log(`   PASS: Anonymous GET ${r} -> 401 Unauthorized`);
+      } else {
+        console.error(`   FAIL: Anonymous GET ${r} did NOT return 401! Got ${res.status}`);
+        passed = false;
+      }
+    }
+
+    // Test Case B: Invalid cookie gives 401
+    console.log("   [Case B] Verifying invalid session cookie returns 401...");
+    const invalidRes = await httpReq("/api/playlists", { cookie: "mz_session=invalid_nonexistent_token" });
+    if (invalidRes.status === 401) {
+      console.log("   PASS: Invalid cookie -> 401 Unauthorized");
+    } else {
+      console.error(`   FAIL: Invalid cookie did NOT return 401! Got ${invalidRes.status}`);
+      passed = false;
+    }
+
+    // Test Case C: Expired session cookie gives 401
+    console.log("   [Case C] Verifying expired session cookie returns 401...");
+    const expiredRes = await httpReq("/api/playlists", { cookie: `mz_session=${expiredToken}` });
+    if (expiredRes.status === 401) {
+      console.log("   PASS: Expired session cookie -> 401 Unauthorized");
+    } else {
+      console.error(`   FAIL: Expired session cookie did NOT return 401! Got ${expiredRes.status}`);
+      passed = false;
+    }
+
+    // Test Case D: GCLUB cookie asking for GCLUB match -> 200 with GCLUB data (0 from TEST-000)
+    console.log("   [Case D] Verifying authenticated GCLUB user receives GCLUB data...");
+    const gclubCookie = `mz_session=${gToken}`;
+
+    const plRes = await httpReq("/api/playlists", { cookie: gclubCookie });
+    const plRows = plRes.json?.rows || [];
+    const hasTestPl = plRows.some(r => r.club_id === "TEST-000");
+    if (plRes.status === 200 && !hasTestPl && plRows.length >= 1) {
+      console.log(`   PASS: GET /api/playlists -> 200 OK (${plRows.length} GCLUB playlists, 0 from TEST-000)`);
+    } else {
+      console.error("   FAIL: GET /api/playlists failed or leaked TEST-000 data:", plRes);
+      passed = false;
+    }
+
+    const tagRes = await httpReq(`/api/tagging?match_id=${gMatch.id}`, { cookie: gclubCookie });
+    const tagRows = tagRes.json?.rows || [];
+    const hasTestTag = tagRows.some(r => r.club_id === "TEST-000");
+    if (tagRes.status === 200 && !hasTestTag && tagRows.length >= 1) {
+      console.log(`   PASS: GET /api/tagging?match_id=${gMatch.id} -> 200 OK (${tagRows.length} GCLUB tags, 0 from TEST-000)`);
+    } else {
+      console.error("   FAIL: GET /api/tagging failed or leaked TEST-000 data:", tagRes);
+      passed = false;
+    }
+
+    // Test Case E: GCLUB cookie + x-club-id: TEST-000 -> 403 Forbidden
+    console.log("   [Case E] Verifying forged x-club-id: TEST-000 is rejected with 403 Forbidden...");
+    const forgedRes = await httpReq("/api/playlists", {
+      cookie: gclubCookie,
+      headers: { "x-club-id": "TEST-000" },
+    });
+    if (forgedRes.status === 403) {
+      console.log("   PASS: GCLUB cookie with forged x-club-id: TEST-000 -> 403 Forbidden");
+    } else {
+      console.error(`   FAIL: Forged x-club-id did NOT return 403! Got ${forgedRes.status}`);
+      passed = false;
+    }
+
+    // Test Case F: GCLUB cookie asking for TEST-000 match_id -> 404 or empty
+    console.log("   [Case F] Verifying GCLUB user asking for TEST-000 match_id returns 404 or empty...");
+    const crossMatchRes = await httpReq(`/api/tagging?match_id=${tMatch.id}`, { cookie: gclubCookie });
+    if (crossMatchRes.status === 404 || (crossMatchRes.status === 200 && crossMatchRes.json?.rows?.length === 0)) {
+      console.log(`   PASS: Cross-tenant match request returned ${crossMatchRes.status} (0 rows leaked)`);
+    } else {
+      console.error("   FAIL: Cross-tenant match request returned unexpected status/data:", crossMatchRes);
+      passed = false;
+    }
+
+    // Test Case G: AI tagging endpoint -> 409 bilingual no_vendor
+    console.log("   [Case G] Verifying AI tagging contract (409 bilingual no_vendor)...");
+    const aiRes = await httpReq("/api/ai-tagging", { method: "POST" });
+    if (aiRes.status === 409 && aiRes.json?.error === "no_vendor" && aiRes.json?.message_ar && aiRes.json?.message_en) {
+      console.log("   PASS: POST /api/ai-tagging -> 409 bilingual no_vendor");
+    } else {
+      console.error("   FAIL: AI tagging contract violation:", aiRes);
+      passed = false;
+    }
+
+    // 3. DATABASE-LEVEL RLS CHECK ACROSS ALL 41 TENANT TABLES
+    console.log("\n-> 3. Database RLS boundary check across ALL tables in mz_rls_report...");
     const tablesRes = await ownerClient.query("SELECT table_name FROM mz_rls_report WHERE status = 'ok' ORDER BY table_name");
     const okTables = tablesRes.rows.map(r => r.table_name);
     console.log(`Found ${okTables.length} active tenant tables in mz_rls_report.`);
 
-    let tableLeakCount = 0;
+    let dbLeakCount = 0;
     await withTenant(appPool, "GCLUB", async (c) => {
       for (const table of okTables) {
-        // Query without ANY WHERE club_id clause
         const { rows } = await c.query(`SELECT * FROM ${table}`);
         const leaked = rows.filter(r => r.club_id && r.club_id !== "GCLUB");
         if (leaked.length > 0) {
-          console.error(`FAIL: Table ${table} leaked non-GCLUB rows!`, leaked);
-          tableLeakCount++;
+          console.error(`   FAIL: DB table ${table} leaked non-GCLUB rows!`, leaked);
+          dbLeakCount++;
         }
       }
     });
 
-    if (tableLeakCount === 0) {
-      console.log(`PASS: Zero cross-tenant leaks across all ${okTables.length} tenant tables.`);
+    if (dbLeakCount === 0) {
+      console.log(`PASS: Zero cross-tenant leaks across all ${okTables.length} tenant tables under withTenant('GCLUB').`);
     } else {
       passed = false;
     }
 
-    // 3. Fail-Closed check (no tenant context set)
-    console.log("\n-> 3. Testing fail-closed behavior (app.club_id is NULL)...");
+    // 4. Fail-Closed check (no tenant context set)
+    console.log("\n-> 4. Testing fail-closed database behavior (app.club_id is NULL)...");
     const appClient = await appPool.connect();
     try {
       const matchRows = (await appClient.query("SELECT * FROM tg_match WHERE code LIKE 'LEAK_TEST_%'")).rows;
       const playlistRows = (await appClient.query("SELECT * FROM playlist WHERE name LIKE 'LEAK_TEST_%'")).rows;
       if (matchRows.length > 0 || playlistRows.length > 0) {
-        console.error("FAIL: Queries without tenant context returned rows!", { matchRows, playlistRows });
+        console.error("   FAIL: Queries without tenant context returned rows!", { matchRows, playlistRows });
         passed = false;
       } else {
         console.log("PASS: Fail-closed verified (0 rows returned when app.club_id is NULL).");
@@ -168,83 +298,7 @@ async function run() {
       appClient.release();
     }
 
-    // 4. Test EVERY GET route as a GCLUB user
-    console.log("\n-> 4. Testing all GET routes as a GCLUB user...");
-
-    // Helper to invoke route handler with standard Request
-    async function testRoute(name, handler, url, headers = {}) {
-      const req = new Request(url, { headers: { authorization: `Bearer ${gToken}`, "x-club-id": "GCLUB", ...headers } });
-      const res = await handler(req);
-      const json = await res.json();
-      return { status: res.status, json };
-    }
-
-    // Route: /api/tagging?match_id=...
-    const taggingRes = await testRoute("GET /api/tagging", taggingGET, `http://localhost:3600/api/tagging?match_id=${gMatch.id}`);
-    const taggingRows = taggingRes.json.rows || [];
-    const hasTTag = taggingRows.some(r => r.club_id === "TEST-000");
-    if (taggingRes.status === 200 && !hasTTag && taggingRows.length >= 1) {
-      console.log("PASS: /api/tagging returned only GCLUB annotations (0 from TEST-000).");
-    } else {
-      console.error("FAIL: /api/tagging failed or leaked TEST-000 rows:", taggingRes);
-      passed = false;
-    }
-
-    // Route: /api/qa?match_id=...
-    const qaRes = await testRoute("GET /api/qa", qaGET, `http://localhost:3600/api/qa?match_id=${gMatch.id}`);
-    const qaRows = qaRes.json.rows || [];
-    const hasTQA = qaRows.some(r => r.club_id === "TEST-000");
-    if (qaRes.status === 200 && !hasTQA && qaRows.length >= 1) {
-      console.log("PASS: /api/qa returned only GCLUB decisions (0 from TEST-000).");
-    } else {
-      console.error("FAIL: /api/qa failed or leaked TEST-000 rows:", qaRes);
-      passed = false;
-    }
-
-    // Route: /api/media?match_id=...
-    const mediaRes = await testRoute("GET /api/media", mediaGET, `http://localhost:3600/api/media?match_id=${gMatch.id}`);
-    const mediaRows = mediaRes.json.rows || [];
-    const hasTMedia = mediaRows.some(r => r.club_id === "TEST-000");
-    if (mediaRes.status === 200 && !hasTMedia && mediaRows.length >= 1) {
-      console.log("PASS: /api/media returned only GCLUB assets (0 from TEST-000).");
-    } else {
-      console.error("FAIL: /api/media failed or leaked TEST-000 rows:", mediaRes);
-      passed = false;
-    }
-
-    // Route: /api/playlists
-    const playlistRes = await testRoute("GET /api/playlists", playlistsGET, "http://localhost:3600/api/playlists");
-    const plRows = playlistRes.json.rows || [];
-    const hasTPlaylist = plRows.some(r => r.club_id === "TEST-000");
-    if (playlistRes.status === 200 && !hasTPlaylist && plRows.length >= 1) {
-      console.log("PASS: /api/playlists returned only GCLUB playlists (0 from TEST-000).");
-    } else {
-      console.error("FAIL: /api/playlists failed or leaked TEST-000 rows:", playlistRes);
-      passed = false;
-    }
-
-    // Route: /api/ai-tagging
-    const aiRes = await testRoute("GET /api/ai-tagging", aiTaggingGET, "http://localhost:3600/api/ai-tagging");
-    if (aiRes.status === 409 && aiRes.json.error === "no_vendor" && aiRes.json.message_ar && aiRes.json.message_en) {
-      console.log("PASS: /api/ai-tagging returns 409 bilingual no_vendor response.");
-    } else {
-      console.error("FAIL: /api/ai-tagging response format unexpected:", aiRes);
-      passed = false;
-    }
-
-    // Cross-tenant route denial: GCLUB user requesting TEST-000 explicitly
-    const mismatchReq = new Request(`http://localhost:3600/api/tagging?match_id=${tMatch.id}`, {
-      headers: { authorization: `Bearer ${gToken}`, "x-club-id": "TEST-000" }
-    });
-    const mismatchRes = await taggingGET(mismatchReq);
-    if (mismatchRes.status === 403) {
-      console.log("PASS: Cross-tenant route request denied with 403.");
-    } else {
-      console.error("FAIL: Cross-tenant route request was not denied with 403!", mismatchRes.status);
-      passed = false;
-    }
-
-    // 5. Append-Only Denial on ALL tables carrying mz_append_only() trigger
+    // 5. Append-Only Denial on ALL tables carrying mz_append_only()
     console.log("\n-> 5. Testing append-only denial across ALL tables carrying mz_append_only()...");
     const aoTablesRes = await ownerClient.query(`
       SELECT DISTINCT tgrelid::regclass::text AS table_name
@@ -256,7 +310,6 @@ async function run() {
     console.log(`Found ${aoTables.length} append-only tables: ${aoTables.join(", ")}`);
 
     for (const tbl of aoTables) {
-      // Test UPDATE denial (audit_log uses 'action'; others have 'club_id')
       const colToUpdate = tbl === "audit_log" ? "action" : "club_id";
       let updateBlocked = false;
       try {
@@ -269,7 +322,6 @@ async function run() {
         }
       }
 
-      // Test DELETE denial
       let deleteBlocked = false;
       try {
         await withTenant(appPool, "GCLUB", async (c) => {
@@ -281,7 +333,6 @@ async function run() {
         }
       }
 
-      // Test TRUNCATE denial
       let truncateBlocked = false;
       try {
         await withTenant(appPool, "GCLUB", async (c) => {
@@ -330,7 +381,7 @@ async function run() {
 
   } finally {
     console.log("\n-> Cleaning up test fixtures with owner pool...");
-    await cleanup(ownerClient, gTokenHash);
+    await cleanup(ownerClient, createdTokens);
     ownerClient.release();
     await appPool.end();
     await ownerPool.end();

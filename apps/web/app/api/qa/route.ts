@@ -13,7 +13,6 @@ export async function GET(req: Request) {
 
     const { clubId } = await getAuthContext(req);
 
-    // Defense in depth: RLS enforces club_id = mz_club(), and SQL query explicitly binds a.club_id = $2
     const rows = await withTenant(pool, clubId, async (c) => {
       const { rows } = await c.query(
         `SELECT qd.id, qd.club_id, qd.annotation_id, qd.decision, qd.decided_at
@@ -26,9 +25,17 @@ export async function GET(req: Request) {
       return rows;
     });
 
+    if (rows.length === 0) {
+      return Response.json({ rows: [] }, { status: 404 });
+    }
+
     return Response.json({ rows });
   } catch (err: any) {
-    const status = err.message?.includes("unauthorized") ? 403 : 400;
+    const status = err.message?.includes("UNAUTHORIZED")
+      ? 401
+      : err.message?.includes("FORBIDDEN")
+      ? 403
+      : 400;
     return Response.json({ error: err.message }, { status });
   }
 }
