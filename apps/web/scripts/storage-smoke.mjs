@@ -64,16 +64,14 @@ async function run() {
   const wslVideoPath = tempVideoPath.replace(/\\/g, "/").replace(/^([A-Za-z]):/, (_, d) => `/mnt/${d.toLowerCase()}`);
 
   try {
-    // Generate ~12-14 MB video: 20s, 640x360, 30fps, 5.5 Mbps
-    // Try via wsl directly or docker
-    let generated = false;
+    // Generate ~15 MB video: 20s, 1280x720, 30fps, 6 Mbps
+    const filter = "testsrc=s=1280x720:r=30,noise=alls=20:allf=t+u";
+    const dir = path.dirname(wslVideoPath);
+    const base = path.basename(wslVideoPath);
     try {
-      execSync(`wsl ffmpeg -y -f lavfi -i testsrc=duration=20:size=640x360:rate=30 -c:v libx264 -b:v 5500k -pix_fmt yuv420p "${wslVideoPath}" 2>&1`, { stdio: "pipe" });
-      generated = true;
+      execSync(`wsl docker run --rm -v "${dir}:/out" mezzala-worker ffmpeg -y -f lavfi -i "${filter}" -t 20 -c:v libx264 -preset ultrafast -b:v 6000k -pix_fmt yuv420p "/out/${base}" 2>&1`, { stdio: "pipe" });
     } catch {
-      // Fallback to worker docker image
-      execSync(`wsl docker run --rm -v "${path.dirname(wslVideoPath)}:/out" mezzala-worker ffmpeg -y -f lavfi -i testsrc=duration=20:size=640x360:rate=30 -c:v libx264 -b:v 5500k -pix_fmt yuv420p "/out/${path.basename(wslVideoPath)}" 2>&1`, { stdio: "pipe" });
-      generated = true;
+      execSync(`wsl ffmpeg -y -f lavfi -i "${filter}" -t 20 -c:v libx264 -preset ultrafast -b:v 6000k -pix_fmt yuv420p "${wslVideoPath}" 2>&1`, { stdio: "pipe" });
     }
 
     if (!existsSync(tempVideoPath)) {
