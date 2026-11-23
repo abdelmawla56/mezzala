@@ -1,19 +1,33 @@
 // apps/web/app/api/media/route.ts
-import { NextRequest, NextResponse } from "next/server";
-import pool from "../../../lib/db";
-import { withTenant } from "../../../lib/db/with-tenant";
+import pool from "../../../lib/db.ts";
+import { withTenant } from "../../../lib/db/with-tenant.ts";
+import { getAuthContext } from "../../../lib/auth.ts";
 
-export async function GET(req: NextRequest) {
-  const { searchParams } = new URL(req.url);
-  const clubId = req.headers.get("x-club-id") ?? "";
-  const matchId = Number(searchParams.get("match_id") ?? 0);
-  if (!clubId || !matchId) return NextResponse.json({ error: "missing params" }, { status: 400 });
-  const rows = await withTenant(pool, clubId, async (c) => {
-    const { rows } = await c.query(
-      `SELECT id, filename, s3_key, bytes, duration_ms, upload_state FROM media_asset WHERE match_id = $1`,
-      [matchId]
-    );
-    return rows;
-  });
-  return NextResponse.json({ rows });
+export async function GET(req: Request) {
+  try {
+    const { searchParams } = new URL(req.url);
+    const matchId = Number(searchParams.get("match_id") ?? 0);
+    if (!matchId) {
+      return Response.json({ error: "missing_match_id" }, { status: 400 });
+    }
+
+    const { clubId } = await getAuthContext(req);
+
+    // Defense in depth: RLS enforces club_id = mz_club(), and SQL query explicitly binds club_id = $2
+    const rows = await withTenant(pool, clubId, async (c) => {
+      const { rows } = await c.query(
+        `SELECT id, club_id, filename, s3_key, bytes, duration_ms, upload_state
+           FROM media_asset
+          WHERE match_id = $1 AND club_id = $2
+          ORDER BY id DESC`,
+        [matchId, clubId]
+      );
+      return rows;
+    });
+
+    return Response.json({ rows });
+  } catch (err: any) {
+    const status = err.message?.includes("unauthorized") ? 403 : 400;
+    return Response.json({ error: err.message }, { status });
+  }
 }

@@ -1,21 +1,36 @@
 // apps/web/app/api/tagging/route.ts
-import { NextRequest, NextResponse } from "next/server";
-import pool from "../../../lib/db";
-import { withTenant } from "../../../lib/db/with-tenant";
+import pool from "../../../lib/db.ts";
+import { withTenant } from "../../../lib/db/with-tenant.ts";
+import { getAuthContext } from "../../../lib/auth.ts";
 
-export async function GET(req: NextRequest) {
-  const { searchParams } = new URL(req.url);
-  const clubId = req.headers.get("x-club-id") ?? "";
-  const matchId = Number(searchParams.get("match_id") ?? 0);
-  if (!clubId || !matchId) return NextResponse.json({ error: "missing params" }, { status: 400 });
-  const rows = await withTenant(pool, clubId, async (c) => {
-    const { rows } = await c.query(
-      `SELECT a.id, ar.rev, ar.match_ms, ar.payload FROM annotation a
-         JOIN annotation_revision ar ON ar.annotation_id = a.id
-        WHERE a.match_id = $1 AND ar.rev = (SELECT max(r.rev) FROM annotation_revision r WHERE r.annotation_id = a.id)`,
-      [matchId]
-    );
-    return rows;
-  });
-  return NextResponse.json({ rows });
+export async function GET(req: Request) {
+  try {
+    const { searchParams } = new URL(req.url);
+    const matchId = Number(searchParams.get("match_id") ?? 0);
+    if (!matchId) {
+      return Response.json({ error: "missing_match_id" }, { status: 400 });
+    }
+
+    const { clubId } = await getAuthContext(req);
+
+    // Defense in depth: RLS enforces club_id = mz_club(), and SQL query explicitly binds club_id = $2
+    const rows = await withTenant(pool, clubId, async (c) => {
+      const { rows } = await c.query(
+        `SELECT a.id, a.club_id, ar.rev, ar.match_ms, ar.payload
+           FROM annotation a
+           JOIN annotation_revision ar ON ar.annotation_id = a.id
+          WHERE a.match_id = $1
+            AND a.club_id = $2
+            AND ar.rev = (SELECT max(r.rev) FROM annotation_revision r WHERE r.annotation_id = a.id)
+          ORDER BY ar.match_ms ASC`,
+        [matchId, clubId]
+      );
+      return rows;
+    });
+
+    return Response.json({ rows });
+  } catch (err: any) {
+    const status = err.message?.includes("unauthorized") ? 403 : 400;
+    return Response.json({ error: err.message }, { status });
+  }
 }
