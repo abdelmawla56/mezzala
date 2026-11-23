@@ -5,13 +5,26 @@ import { getAuthContext } from "../../../lib/auth.ts";
 
 export async function GET(req: Request) {
   try {
+    const { clubId } = await getAuthContext(req);
+
     const { searchParams } = new URL(req.url);
     const matchId = Number(searchParams.get("match_id") ?? 0);
     if (!matchId) {
       return Response.json({ error: "missing_match_id" }, { status: 400 });
     }
 
-    const { clubId } = await getAuthContext(req);
+    // Explicit lookup of the match first for the current tenant
+    const matchExists = await withTenant(pool, clubId, async (c) => {
+      const { rows } = await c.query(
+        `SELECT id FROM tg_match WHERE id = $1 AND club_id = $2`,
+        [matchId, clubId]
+      );
+      return rows.length > 0;
+    });
+
+    if (!matchExists) {
+      return Response.json({ error: "match_not_found" }, { status: 404 });
+    }
 
     const rows = await withTenant(pool, clubId, async (c) => {
       const { rows } = await c.query(
@@ -24,10 +37,6 @@ export async function GET(req: Request) {
       );
       return rows;
     });
-
-    if (rows.length === 0) {
-      return Response.json({ rows: [] }, { status: 404 });
-    }
 
     return Response.json({ rows });
   } catch (err: any) {

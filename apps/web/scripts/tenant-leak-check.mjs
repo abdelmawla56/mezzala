@@ -56,7 +56,7 @@ const ownerPool = new pg.Pool({ connectionString: DATABASE_URL_OWNER, max: 2 });
 
 import { withTenant } from "../lib/db/with-tenant.ts";
 import { hashToken } from "../lib/auth.ts";
-import { assertNoSuperuser } from "../lib/db.ts";
+import { assertRuntimeRole, resetRoleGuardForTesting } from "../lib/db.ts";
 
 const BASE_URL = process.env.TEST_BASE_URL || "http://localhost:3600";
 
@@ -96,6 +96,9 @@ async function run() {
     console.log("\n-> 1. Seeding dual-tenant fixtures (GCLUB & TEST-000)...");
     const gMatch = (await ownerClient.query(
       "INSERT INTO tg_match (club_id, code, match_date, home_team, away_team) VALUES ('GCLUB', 'LEAK_TEST_G', CURRENT_DATE, 'GHome', 'GAway') RETURNING id"
+    )).rows[0];
+    const gMatchEmpty = (await ownerClient.query(
+      "INSERT INTO tg_match (club_id, code, match_date, home_team, away_team) VALUES ('GCLUB', 'LEAK_TEST_EMPTY', CURRENT_DATE, 'GHomeEmpty', 'GAwayEmpty') RETURNING id"
     )).rows[0];
     const tMatch = (await ownerClient.query(
       "INSERT INTO tg_match (club_id, code, match_date, home_team, away_team) VALUES ('TEST-000', 'LEAK_TEST_T', CURRENT_DATE, 'THome', 'TAway') RETURNING id"
@@ -238,13 +241,41 @@ async function run() {
       passed = false;
     }
 
-    // Test Case F: GCLUB cookie asking for TEST-000 match_id -> 404 or empty
-    console.log("   [Case F] Verifying GCLUB user asking for TEST-000 match_id returns 404 or empty...");
-    const crossMatchRes = await httpReq(`/api/tagging?match_id=${tMatch.id}`, { cookie: gclubCookie });
-    if (crossMatchRes.status === 404 || (crossMatchRes.status === 200 && crossMatchRes.json?.rows?.length === 0)) {
-      console.log(`   PASS: Cross-tenant match request returned ${crossMatchRes.status} (0 rows leaked)`);
+    // Test Case E2: GCLUB user requesting empty-but-valid match -> 200 with empty rows []
+    console.log("   [Case E2] Verifying empty-but-valid match returns 200 with empty list...");
+    const emptyTagRes = await httpReq(`/api/tagging?match_id=${gMatchEmpty.id}`, { cookie: gclubCookie });
+    const emptyMediaRes = await httpReq(`/api/media?match_id=${gMatchEmpty.id}`, { cookie: gclubCookie });
+    const emptyQaRes = await httpReq(`/api/qa?match_id=${gMatchEmpty.id}`, { cookie: gclubCookie });
+
+    if (emptyTagRes.status === 200 && Array.isArray(emptyTagRes.json?.rows) && emptyTagRes.json.rows.length === 0 &&
+        emptyMediaRes.status === 200 && Array.isArray(emptyMediaRes.json?.rows) && emptyMediaRes.json.rows.length === 0 &&
+        emptyQaRes.status === 200 && Array.isArray(emptyQaRes.json?.rows) && emptyQaRes.json.rows.length === 0) {
+      console.log(`   PASS: Empty-but-valid match returned 200 with [] on /api/tagging, /api/media, /api/qa`);
     } else {
-      console.error("   FAIL: Cross-tenant match request returned unexpected status/data:", crossMatchRes);
+      console.error("   FAIL: Empty-but-valid match did not return 200 with empty list:", {
+        tagging: emptyTagRes,
+        media: emptyMediaRes,
+        qa: emptyQaRes,
+      });
+      passed = false;
+    }
+
+    // Test Case F: GCLUB cookie asking for TEST-000 match_id or missing match -> 404 match_not_found
+    console.log("   [Case F] Verifying GCLUB user asking for cross-tenant or missing match_id returns 404...");
+    const crossMatchRes = await httpReq(`/api/tagging?match_id=${tMatch.id}`, { cookie: gclubCookie });
+    const crossMediaRes = await httpReq(`/api/media?match_id=${tMatch.id}`, { cookie: gclubCookie });
+    const crossQaRes = await httpReq(`/api/qa?match_id=${tMatch.id}`, { cookie: gclubCookie });
+    const missingMatchRes = await httpReq(`/api/tagging?match_id=999999`, { cookie: gclubCookie });
+
+    if (crossMatchRes.status === 404 && crossMediaRes.status === 404 && crossQaRes.status === 404 && missingMatchRes.status === 404) {
+      console.log("   PASS: Cross-tenant & non-existent match requests returned 404 (0 rows leaked)");
+    } else {
+      console.error("   FAIL: Cross-tenant/missing match request did not return 404:", {
+        crossTag: crossMatchRes.status,
+        crossMedia: crossMediaRes.status,
+        crossQa: crossQaRes.status,
+        missing: missingMatchRes.status,
+      });
       passed = false;
     }
 
@@ -352,30 +383,39 @@ async function run() {
       }
     }
 
-    // 6. Test Startup Guard against Superuser
-    console.log("\n-> 6. Testing startup guard against superuser connection...");
-    let superuserBlocked = false;
+    // 6. Test Runtime-Role Guard against Superuser / Owner URL
+    console.log("\n-> 6. Testing runtime-role guard against superuser & owner URL...");
+    let ownerUrlBlocked = false;
+    let ownerErrorMsg = "";
     try {
-      await assertNoSuperuser(ownerClient);
+      resetRoleGuardForTesting();
+      // Attempting withTenant on ownerPool (which connects as owner/superuser) must fail
+      await withTenant(ownerPool, "GCLUB", async () => {});
     } catch (err) {
-      if (err.message.includes("CRITICAL SECURITY ERROR") || err.message.includes("superuser")) {
-        superuserBlocked = true;
+      ownerErrorMsg = err.message;
+      if (err.message.includes("CRITICAL SECURITY ERROR") || err.message.includes("mz_app")) {
+        ownerUrlBlocked = true;
       }
     }
 
     let appAllowed = false;
-    const appCheckClient = await appPool.connect();
     try {
-      await assertNoSuperuser(appCheckClient);
-      appAllowed = true;
-    } finally {
-      appCheckClient.release();
+      resetRoleGuardForTesting();
+      // withTenant on appPool (role mz_app, no superuser, no BYPASSRLS) must succeed
+      await withTenant(appPool, "GCLUB", async (c) => {
+        const { rows } = await c.query("SELECT current_user");
+        if (rows[0]?.current_user === "mz_app") {
+          appAllowed = true;
+        }
+      });
+    } catch (err) {
+      console.error("appPool withTenant failed:", err);
     }
 
-    if (superuserBlocked && appAllowed) {
-      console.log("PASS: Startup guard successfully denies superuser and permits mz_app.");
+    if (ownerUrlBlocked && appAllowed) {
+      console.log(`PASS: Runtime-role guard successfully blocked owner URL ('${ownerErrorMsg.trim()}') and permitted mz_app.`);
     } else {
-      console.error(`FAIL: Startup guard check failed: superuserBlocked=${superuserBlocked}, appAllowed=${appAllowed}`);
+      console.error(`FAIL: Runtime-role guard check failed: ownerUrlBlocked=${ownerUrlBlocked}, appAllowed=${appAllowed}`);
       passed = false;
     }
 

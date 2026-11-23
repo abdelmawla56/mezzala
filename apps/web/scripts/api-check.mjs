@@ -28,9 +28,11 @@ function loadEnv(filePath) {
 
 loadEnv(envPath);
 
-const { DATABASE_URL } = process.env;
+const { DATABASE_URL, DATABASE_URL_OWNER } = process.env;
 const pool = new pg.Pool({ connectionString: DATABASE_URL, max: 2 });
+const ownerPool = new pg.Pool({ connectionString: DATABASE_URL_OWNER, max: 2 });
 
+import { hashToken } from "../lib/auth.ts";
 import { POST as loginPOST } from "../app/api/auth/login/route.ts";
 import { GET as taggingGET } from "../app/api/tagging/route.ts";
 import { GET as mediaGET } from "../app/api/media/route.ts";
@@ -93,17 +95,34 @@ async function run() {
   }
   console.log("PASS: /api/auth/login Content-Type and validation verified");
 
-  // 3. Missing params check on tenant routes
-  const noMatchTagging = await taggingGET(new Request("http://localhost:3600/api/tagging", { headers: { "x-club-id": "GCLUB" } }));
-  if (noMatchTagging.status !== 400) throw new Error("Expected 400 on missing match_id");
+  // 3. Missing params check on tenant routes (using authenticated session)
+  const apiCheckToken = "api_check_valid_session_token_xyz";
+  const oc = await ownerPool.connect();
+  try {
+    const userRes = await oc.query("SELECT id FROM users WHERE email = 'admin@gclub.dev'");
+    const userId = userRes.rows[0]?.id || 1;
+    await oc.query(
+      "INSERT INTO sessions (token_hash, user_id, expires_at) VALUES ($1, $2, now() + interval '1 hour') ON CONFLICT (token_hash) DO UPDATE SET expires_at = EXCLUDED.expires_at",
+      [hashToken(apiCheckToken), userId]
+    );
 
-  const noMatchMedia = await mediaGET(new Request("http://localhost:3600/api/media", { headers: { "x-club-id": "GCLUB" } }));
-  if (noMatchMedia.status !== 400) throw new Error("Expected 400 on missing match_id");
+    const authHeaders = { authorization: `Bearer ${apiCheckToken}` };
 
-  const noMatchQA = await qaGET(new Request("http://localhost:3600/api/qa", { headers: { "x-club-id": "GCLUB" } }));
-  if (noMatchQA.status !== 400) throw new Error("Expected 400 on missing match_id");
+    const noMatchTagging = await taggingGET(new Request("http://localhost:3600/api/tagging", { headers: authHeaders }));
+    if (noMatchTagging.status !== 400) throw new Error(`Expected 400 on missing match_id, got ${noMatchTagging.status}`);
 
-  console.log("PASS: Parameter validation verified on /api/tagging, /api/media, /api/qa");
+    const noMatchMedia = await mediaGET(new Request("http://localhost:3600/api/media", { headers: authHeaders }));
+    if (noMatchMedia.status !== 400) throw new Error(`Expected 400 on missing match_id, got ${noMatchMedia.status}`);
+
+    const noMatchQA = await qaGET(new Request("http://localhost:3600/api/qa", { headers: authHeaders }));
+    if (noMatchQA.status !== 400) throw new Error(`Expected 400 on missing match_id, got ${noMatchQA.status}`);
+
+    console.log("PASS: Parameter validation verified on /api/tagging, /api/media, /api/qa");
+  } finally {
+    await oc.query("DELETE FROM sessions WHERE token_hash = $1", [hashToken(apiCheckToken)]).catch(() => {});
+    oc.release();
+    await ownerPool.end();
+  }
 
   // 4. Missing tenant / unauthenticated check
   const noClubPlaylists = await playlistsGET(new Request("http://localhost:3600/api/playlists"));

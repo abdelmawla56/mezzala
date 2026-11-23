@@ -3,6 +3,7 @@
 // it opens a transaction and sets app.club_id (SET LOCAL), ensuring pooled connections never
 // bleed tenant state. Outside it, mz_club() is NULL and every tenant policy returns zero rows.
 import type { Pool, PoolClient } from "pg";
+import { ensureRuntimeRoleGuard } from "../db.ts";
 
 export const CLUBS = ["GCLUB", "TEST-000"] as const;
 export type ClubId = (typeof CLUBS)[number];
@@ -28,7 +29,7 @@ export function tenantFor(
   if (!user.clubId) {
     throw new Error("FORBIDDEN: User has no assigned club membership");
   }
-  if (requestedClubId && requestedClubId !== user.clubId && user.role !== "superadmin") {
+  if (requestedClubId && requestedClubId !== user.clubId) {
     throw new Error(`FORBIDDEN: User of '${user.clubId}' cannot access tenant '${requestedClubId}'`);
   }
   return user.clubId;
@@ -37,6 +38,7 @@ export function tenantFor(
 /**
  * Executes a callback within an explicit tenant transaction.
  * Sets app.club_id locally to prevent connection pool leakage.
+ * Awaits runtime-role guard on the first call to guarantee non-superuser, non-BYPASSRLS mz_app role.
  */
 export async function withTenant<T>(
   pool: Pool,
@@ -48,6 +50,7 @@ export async function withTenant<T>(
   }
   const c = await pool.connect();
   try {
+    await ensureRuntimeRoleGuard(c);
     await c.query("BEGIN");
     await c.query("SELECT set_config('app.club_id', $1, true)", [clubId]);
     const out = await fn(c);

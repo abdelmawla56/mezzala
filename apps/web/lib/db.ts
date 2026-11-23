@@ -30,14 +30,41 @@ if (!process.env.DATABASE_URL) {
   throw new Error("DATABASE_URL is not set. Add it to .env.local");
 }
 
-export async function assertNoSuperuser(client: { query: (sql: string) => Promise<{ rows: any[] }> }) {
+let roleGuardPromise: Promise<void> | null = null;
+
+export async function assertRuntimeRole(client: { query: (sql: string) => Promise<{ rows: any[] }> }) {
   const res = await client.query(
-    "SELECT current_user, usesuper FROM pg_user WHERE usename = current_user"
+    `SELECT r.rolname, r.rolsuper, r.rolbypassrls
+       FROM pg_roles r
+      WHERE r.rolname = current_user`
   );
-  const row = res.rows[0];
-  if (row?.usesuper || row?.current_user === "postgres" || row?.current_user === "mezzala") {
-    throw new Error(`CRITICAL SECURITY ERROR: Runtime pool connected as superuser/owner ('${row?.current_user}'). Must connect as mz_app.`);
+  if (res.rows.length === 0) {
+    throw new Error("assertRuntimeRole: cannot resolve current_user");
   }
+  const { rolname, rolsuper, rolbypassrls } = res.rows[0];
+  if (rolsuper) {
+    throw new Error(`CRITICAL SECURITY ERROR: Runtime pool connected as superuser ('${rolname}'). Must connect as mz_app.`);
+  }
+  if (rolbypassrls) {
+    throw new Error(`CRITICAL SECURITY ERROR: Runtime pool connected with BYPASSRLS ('${rolname}'). Must connect as mz_app.`);
+  }
+  if (rolname !== "mz_app") {
+    throw new Error(`CRITICAL SECURITY ERROR: Runtime role must be 'mz_app', but connected as '${rolname}'.`);
+  }
+}
+
+export async function ensureRuntimeRoleGuard(client: { query: (sql: string) => Promise<{ rows: any[] }> }) {
+  if (!roleGuardPromise) {
+    roleGuardPromise = assertRuntimeRole(client).catch((err) => {
+      roleGuardPromise = null;
+      throw err;
+    });
+  }
+  await roleGuardPromise;
+}
+
+export function resetRoleGuardForTesting() {
+  roleGuardPromise = null;
 }
 
 const pool = new Pool({
