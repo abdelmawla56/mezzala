@@ -118,24 +118,33 @@ async function run() {
     if (noMatchQA.status !== 400) throw new Error(`Expected 400 on missing match_id, got ${noMatchQA.status}`);
 
     console.log("PASS: Parameter validation verified on /api/tagging, /api/media, /api/qa");
+
+    // 4. Missing tenant / unauthenticated check (inside try so authHeaders is in scope below)
+    const noClubPlaylists = await playlistsGET(new Request("http://localhost:3600/api/playlists"));
+    if (noClubPlaylists.status !== 401) throw new Error(`Expected 401 on unauthenticated request, got ${noClubPlaylists.status}`);
+    console.log("PASS: Authentication requirement verified on /api/playlists (401 Unauthorized)");
+
+    // 5. AI Tagging contract verification
+    // 5a. Anonymous requests must yield 401 (auth guard runs before vendor check)
+    const aiGetAnon = await aiGET(new Request("http://localhost:3600/api/ai-tagging"));
+    if (aiGetAnon.status !== 401) throw new Error(`Expected 401 on anonymous AI tagging GET, got ${aiGetAnon.status}`);
+
+    const aiPostAnon = await aiPOST(new Request("http://localhost:3600/api/ai-tagging", { method: "POST" }));
+    if (aiPostAnon.status !== 401) throw new Error(`Expected 401 on anonymous AI tagging POST, got ${aiPostAnon.status}`);
+    console.log("PASS: Anonymous AI tagging GET/POST -> 401 (auth guard fires first)");
+
+    // 5b. Authenticated requests must yield 409 no_vendor
+    const aiGet = await aiGET(new Request("http://localhost:3600/api/ai-tagging", { headers: authHeaders }));
+    if (aiGet.status !== 409) throw new Error(`Expected 409 on authenticated AI tagging GET, got ${aiGet.status}`);
+
+    const aiPost = await aiPOST(new Request("http://localhost:3600/api/ai-tagging", { method: "POST", headers: authHeaders }));
+    if (aiPost.status !== 409) throw new Error(`Expected 409 on authenticated AI tagging POST, got ${aiPost.status}`);
+    console.log("PASS: Authenticated AI tagging GET/POST -> 409 no_vendor contract verified");
   } finally {
     await oc.query("DELETE FROM sessions WHERE token_hash = $1", [hashToken(apiCheckToken)]).catch(() => {});
     oc.release();
     await ownerPool.end();
   }
-
-  // 4. Missing tenant / unauthenticated check
-  const noClubPlaylists = await playlistsGET(new Request("http://localhost:3600/api/playlists"));
-  if (noClubPlaylists.status !== 401) throw new Error(`Expected 401 on unauthenticated request, got ${noClubPlaylists.status}`);
-  console.log("PASS: Authentication requirement verified on /api/playlists (401 Unauthorized)");
-
-  // 5. AI Tagging contract verification
-  const aiGet = await aiGET(new Request("http://localhost:3600/api/ai-tagging"));
-  if (aiGet.status !== 409) throw new Error("Expected 409 on AI tagging");
-
-  const aiPost = await aiPOST(new Request("http://localhost:3600/api/ai-tagging", { method: "POST" }));
-  if (aiPost.status !== 409) throw new Error("Expected 409 on AI tagging POST");
-  console.log("PASS: AI tagging 409 contract verified");
 
   console.log("=== api-check.mjs PASSED ===");
 }

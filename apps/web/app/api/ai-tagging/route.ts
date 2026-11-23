@@ -1,5 +1,13 @@
 // apps/web/app/api/ai-tagging/route.ts
-export async function GET(_req: Request) {
+import { getAuthContext } from "../../../lib/auth.ts";
+
+export async function GET(req: Request) {
+  try {
+    await getAuthContext(req);
+  } catch (err: any) {
+    const status = err.message?.includes("FORBIDDEN") ? 403 : 401;
+    return Response.json({ error: err.message }, { status });
+  }
   return Response.json(
     {
       error: "no_vendor",
@@ -10,7 +18,13 @@ export async function GET(_req: Request) {
   );
 }
 
-export async function POST(_req: Request) {
+export async function POST(req: Request) {
+  try {
+    await getAuthContext(req);
+  } catch (err: any) {
+    const status = err.message?.includes("FORBIDDEN") ? 403 : 401;
+    return Response.json({ error: err.message }, { status });
+  }
   return Response.json(
     {
       error: "no_vendor",

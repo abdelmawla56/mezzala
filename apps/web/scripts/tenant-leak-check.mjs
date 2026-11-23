@@ -169,17 +169,19 @@ async function run() {
     // Test Case A: No cookie gives 401 across every tenant route
     console.log("   [Case A] Verifying anonymous requests return 401 on every tenant route...");
     const routesToTest = [
-      "/api/playlists",
-      `/api/tagging?match_id=${gMatch.id}`,
-      `/api/media?match_id=${gMatch.id}`,
-      `/api/qa?match_id=${gMatch.id}`,
+      { method: "GET",  path: "/api/playlists" },
+      { method: "GET",  path: `/api/tagging?match_id=${gMatch.id}` },
+      { method: "GET",  path: `/api/media?match_id=${gMatch.id}` },
+      { method: "GET",  path: `/api/qa?match_id=${gMatch.id}` },
+      { method: "GET",  path: "/api/ai-tagging" },
+      { method: "POST", path: "/api/ai-tagging" },
     ];
-    for (const r of routesToTest) {
-      const res = await httpReq(r);
+    for (const { method, path: r } of routesToTest) {
+      const res = await httpReq(r, { method });
       if (res.status === 401) {
-        console.log(`   PASS: Anonymous GET ${r} -> 401 Unauthorized`);
+        console.log(`   PASS: Anonymous ${method} ${r} -> 401 Unauthorized`);
       } else {
-        console.error(`   FAIL: Anonymous GET ${r} did NOT return 401! Got ${res.status}`);
+        console.error(`   FAIL: Anonymous ${method} ${r} did NOT return 401! Got ${res.status}`);
         passed = false;
       }
     }
@@ -279,11 +281,11 @@ async function run() {
       passed = false;
     }
 
-    // Test Case G: AI tagging endpoint -> 409 bilingual no_vendor
-    console.log("   [Case G] Verifying AI tagging contract (409 bilingual no_vendor)...");
-    const aiRes = await httpReq("/api/ai-tagging", { method: "POST" });
+    // Test Case G: AI tagging endpoint -> 409 bilingual no_vendor (authenticated)
+    console.log("   [Case G] Verifying AI tagging contract (409 bilingual no_vendor) for authenticated user...");
+    const aiRes = await httpReq("/api/ai-tagging", { method: "POST", cookie: gclubCookie });
     if (aiRes.status === 409 && aiRes.json?.error === "no_vendor" && aiRes.json?.message_ar && aiRes.json?.message_en) {
-      console.log("   PASS: POST /api/ai-tagging -> 409 bilingual no_vendor");
+      console.log("   PASS: POST /api/ai-tagging (authenticated) -> 409 bilingual no_vendor");
     } else {
       console.error("   FAIL: AI tagging contract violation:", aiRes);
       passed = false;
