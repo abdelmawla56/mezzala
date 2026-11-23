@@ -66,13 +66,10 @@ async function cleanup(ownerClient, tokenHashes = []) {
     if (tokenHashes.length > 0) {
       await ownerClient.query("DELETE FROM sessions WHERE token_hash = ANY($1)", [tokenHashes]);
     }
-    await ownerClient.query("DELETE FROM playlist_item WHERE club_id IN ('GCLUB', 'TEST-000')");
-    await ownerClient.query("DELETE FROM playlist WHERE name LIKE 'LEAK_TEST_%'");
-    await ownerClient.query("DELETE FROM annotation_revision WHERE match_ms = 999111");
-    await ownerClient.query("DELETE FROM qa_decision WHERE decision = 'accept' AND club_id IN ('GCLUB', 'TEST-000')");
-    await ownerClient.query("DELETE FROM annotation WHERE match_id IN (SELECT id FROM tg_match WHERE code LIKE 'LEAK_TEST_%')");
-    await ownerClient.query("DELETE FROM media_asset WHERE filename LIKE 'leak_test_%'");
-    await ownerClient.query("DELETE FROM tg_match WHERE code LIKE 'LEAK_TEST_%'");
+    const { rows: okTables } = await ownerClient.query("SELECT table_name FROM mz_rls_report WHERE status = 'ok'");
+    for (const { table_name } of okTables) {
+      await ownerClient.query(`DELETE FROM ${table_name} WHERE club_id IN ('GCLUB', 'TEST-000')`);
+    }
   } finally {
     await ownerClient.query("SET session_replication_role = 'origin'").catch(() => {});
   }
@@ -143,6 +140,70 @@ async function run() {
       "INSERT INTO sessions (token_hash, user_id, expires_at) VALUES ($1, $2, now() - interval '1 hour') ON CONFLICT (token_hash) DO UPDATE SET expires_at = EXCLUDED.expires_at",
       [expiredTokenHash, gUserId]
     );
+
+    // Seed dual-tenant fixtures for ALL other writable tenant tables (both GCLUB and TEST-000)
+    for (const club of ["GCLUB", "TEST-000"]) {
+      const isG = club === "GCLUB";
+      const match = isG ? gMatch : tMatch;
+      const ann = isG ? gAnn : tAnn;
+      const uRes = await ownerClient.query("SELECT id FROM users WHERE club_id = $1 LIMIT 1", [club]);
+      const uid = uRes.rows[0]?.id || gUserId;
+
+      // tg_team
+      await ownerClient.query("INSERT INTO tg_team (club_id, name, code) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", [club, `Team ${club}`, `TM_${club}`]);
+      // tenant_flag
+      await ownerClient.query("INSERT INTO tenant_flag (club_id, flag, value) VALUES ($1, 'leak_flag', 'val') ON CONFLICT DO NOTHING", [club]);
+      // tag_template & tag_template_version
+      const ttRes = await ownerClient.query("INSERT INTO tag_template (club_id, name) VALUES ($1, $2) RETURNING id", [club, `Template ${club}`]);
+      await ownerClient.query("INSERT INTO tag_template_version (tag_template_id, club_id, version, schema_json) VALUES ($1, $2, 1, '{}') ON CONFLICT DO NOTHING", [ttRes.rows[0].id, club]);
+      // qa_sample_policy & qa_tolerance
+      await ownerClient.query("INSERT INTO qa_sample_policy (club_id, rate, kind) VALUES ($1, 1, 'all')", [club]);
+      await ownerClient.query("INSERT INTO qa_tolerance (club_id, metric, value) VALUES ($1, 'metric', 1.0)", [club]);
+      // ai_model & ai_model_gate & ai_model_threshold
+      const amRes = await ownerClient.query("INSERT INTO ai_model (club_id, name, kind) VALUES ($1, $2, 'tagging') RETURNING id", [club, `Model ${club}`]);
+      await ownerClient.query("INSERT INTO ai_model_gate (ai_model_id, club_id, enabled) VALUES ($1, $2, true)", [amRes.rows[0].id, club]);
+      await ownerClient.query("INSERT INTO ai_model_threshold (ai_model_id, club_id, metric, threshold) VALUES ($1, $2, 'conf', 0.8)", [amRes.rows[0].id, club]);
+      // rights_record
+      await ownerClient.query("INSERT INTO rights_record (club_id, match_id, notes) VALUES ($1, $2, 'leak note')", [club, match.id]);
+      // analysis_run
+      await ownerClient.query("INSERT INTO analysis_run (club_id, match_id, kind) VALUES ($1, $2, 'leak_analysis')", [club, match.id]);
+      // media_job
+      await ownerClient.query("INSERT INTO media_job (club_id, kind, asset_ref, payload, idempotency_key) VALUES ($1, 'probe', 'leak_asset', '{\"key\":\"leak\"}', $2) ON CONFLICT DO NOTHING", [club, `idem_leak_${club}`]);
+      // tagging_pass & tg_coverage
+      const tpRes = await ownerClient.query("INSERT INTO tagging_pass (match_id, club_id, status) VALUES ($1, $2, 'open') RETURNING id", [match.id, club]);
+      await ownerClient.query("INSERT INTO tg_coverage (pass_id, club_id) VALUES ($1, $2)", [tpRes.rows[0].id, club]);
+      // qa_pending_signature
+      await ownerClient.query("INSERT INTO qa_pending_signature (club_id, annotation_id) VALUES ($1, $2)", [club, ann.id]);
+      // tg_match_status
+      await ownerClient.query("INSERT INTO tg_match_status (match_id, club_id, status) VALUES ($1, $2, 'draft')", [match.id, club]);
+      // tg_lineup
+      await ownerClient.query("INSERT INTO tg_lineup (match_id, club_id, team, player) VALUES ($1, $2, 'Team', 'Player')", [match.id, club]);
+      // tg_minors
+      await ownerClient.query("INSERT INTO tg_minors (match_id, club_id, player) VALUES ($1, $2, 'Minor')", [match.id, club]);
+      // tg_timeline
+      await ownerClient.query("INSERT INTO tg_timeline (match_id, club_id, event_code, match_ms) VALUES ($1, $2, 'EVT', 1000)", [match.id, club]);
+      // tg_direction
+      await ownerClient.query("INSERT INTO tg_direction (match_id, club_id, period, attack_dir) VALUES ($1, $2, 1, 'L2R')", [match.id, club]);
+      // sync_set, sync_anchor, media_gap, media_exclusion
+      const ssRes = await ownerClient.query("INSERT INTO sync_set (match_id, club_id, label) VALUES ($1, $2, 'Sync') RETURNING id", [match.id, club]);
+      await ownerClient.query("INSERT INTO sync_anchor (sync_set_id, club_id, video_ms) VALUES ($1, $2, 100)", [ssRes.rows[0].id, club]);
+      await ownerClient.query("INSERT INTO media_gap (sync_set_id, club_id, start_ms, end_ms) VALUES ($1, $2, 10, 20)", [ssRes.rows[0].id, club]);
+      await ownerClient.query("INSERT INTO media_exclusion (sync_set_id, club_id, reason) VALUES ($1, $2, 'excl')", [ssRes.rows[0].id, club]);
+      // adjudication, agreement_run, counting_assignment, match_signoff, model_run, tg_assignment, event_snapshot
+      await ownerClient.query("INSERT INTO adjudication (match_id, club_id, status) VALUES ($1, $2, 'pending')", [match.id, club]);
+      await ownerClient.query("INSERT INTO agreement_run (match_id, club_id, score) VALUES ($1, $2, 0.9)", [match.id, club]);
+      await ownerClient.query("INSERT INTO counting_assignment (match_id, club_id, user_id) VALUES ($1, $2, $3)", [match.id, club, uid]);
+      await ownerClient.query("INSERT INTO match_signoff (match_id, club_id, action) VALUES ($1, $2, 'signed')", [match.id, club]);
+      await ownerClient.query("INSERT INTO model_run (match_id, club_id, ai_model_id) VALUES ($1, $2, $3)", [match.id, club, amRes.rows[0].id]);
+      await ownerClient.query("INSERT INTO tg_assignment (club_id, match_id, user_id, role) VALUES ($1, $2, $3, 'tagger')", [club, match.id, uid]);
+      await ownerClient.query("INSERT INTO event_snapshot (club_id, match_id, payload) VALUES ($1, $2, '{}')", [club, match.id]);
+      // playlist items, shares, comments
+      const plRes = await ownerClient.query("SELECT id FROM playlist WHERE club_id = $1 LIMIT 1", [club]);
+      const plId = plRes.rows[0].id;
+      await ownerClient.query("INSERT INTO playlist_item (playlist_id, club_id, annotation_id) VALUES ($1, $2, $3)", [plId, club, ann.id]);
+      await ownerClient.query("INSERT INTO playlist_share (playlist_id, club_id, shared_with) VALUES ($1, $2, $3)", [plId, club, uid]);
+      await ownerClient.query("INSERT INTO playlist_comment (playlist_id, club_id, user_id, body) VALUES ($1, $2, $3, 'comment')", [plId, club, uid]);
+    }
 
     // 2. REAL HTTP ROUTE TESTS AGAINST LIVE DEV SERVER
     console.log(`\n-> 2. Executing Real HTTP tests against ${BASE_URL}...`);
@@ -296,6 +357,41 @@ async function run() {
     const tablesRes = await ownerClient.query("SELECT table_name FROM mz_rls_report WHERE status = 'ok' ORDER BY table_name");
     const okTables = tablesRes.rows.map(r => r.table_name);
     console.log(`Found ${okTables.length} active tenant tables in mz_rls_report.`);
+
+    const bothClubsTables = [];
+    const emptyTables = [];
+    const singleClubTables = [];
+
+    for (const table of okTables) {
+      const { rows: counts } = await ownerClient.query(`
+        SELECT count(*) FILTER (WHERE club_id = 'GCLUB') AS g_count,
+               count(*) FILTER (WHERE club_id = 'TEST-000') AS t_count
+          FROM ${table}
+      `);
+      const gCount = Number(counts[0].g_count);
+      const tCount = Number(counts[0].t_count);
+      if (gCount > 0 && tCount > 0) {
+        bothClubsTables.push(table);
+      } else if (gCount === 0 && tCount === 0) {
+        emptyTables.push(table);
+      } else {
+        singleClubTables.push({ table, gCount, tCount });
+      }
+    }
+
+    console.log(`   ${bothClubsTables.length}/${okTables.length} tables held rows for BOTH clubs ('GCLUB' and 'TEST-000').`);
+    console.log(`   Skipped empty tables (${emptyTables.length}):`, emptyTables.length > 0 ? emptyTables.join(", ") : "none");
+    if (singleClubTables.length > 0) {
+      console.log(`   Single club tables (${singleClubTables.length}):`, singleClubTables.map(s => `${s.table} (G:${s.gCount}, T:${s.tCount})`).join(", "));
+    }
+
+    const MINIMUM_DUAL_TENANT_TABLES = 40;
+    if (bothClubsTables.length < MINIMUM_DUAL_TENANT_TABLES) {
+      console.error(`   FAIL: Fewer than stated minimum (${MINIMUM_DUAL_TENANT_TABLES}) tables held rows for both clubs! Found only ${bothClubsTables.length}`);
+      passed = false;
+    } else {
+      console.log(`   PASS: Stated minimum verified: ${bothClubsTables.length} tables (>= ${MINIMUM_DUAL_TENANT_TABLES}) held rows for both clubs.`);
+    }
 
     let dbLeakCount = 0;
     await withTenant(appPool, "GCLUB", async (c) => {

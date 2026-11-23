@@ -98,15 +98,26 @@ async function run() {
     }
     console.log("PASS: qa_decision append-only update denied");
 
-    // Test AI tagging endpoint contract (no real vendor connected yet)
-    const aiReqGet = new Request("http://localhost:3600/api/ai-tagging");
+    // Test AI tagging endpoint contract (anonymous -> 401, authenticated -> 409)
+    const aiReqAnon = new Request("http://localhost:3600/api/ai-tagging");
+    const aiResAnon = await aiGET(aiReqAnon);
+    if (aiResAnon.status !== 401) {
+      throw new Error(`Expected 401 on anonymous AI tagging GET, got ${aiResAnon.status}`);
+    }
+
+    const aiReqGet = new Request("http://localhost:3600/api/ai-tagging", {
+      headers: { authorization: `Bearer ${token}` }
+    });
     const aiResGet = await aiGET(aiReqGet);
     const aiJsonGet = await aiResGet.json();
     if (aiResGet.status !== 409 || aiJsonGet.error !== "no_vendor" || !aiJsonGet.message_en || !aiJsonGet.message_ar) {
       throw new Error(`GET /api/ai-tagging contract violation: ${JSON.stringify(aiJsonGet)}`);
     }
 
-    const aiReqPost = new Request("http://localhost:3600/api/ai-tagging", { method: "POST" });
+    const aiReqPost = new Request("http://localhost:3600/api/ai-tagging", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` }
+    });
     const aiResPost = await aiPOST(aiReqPost);
     const aiJsonPost = await aiResPost.json();
     if (aiResPost.status !== 409 || aiJsonPost.error !== "no_vendor") {

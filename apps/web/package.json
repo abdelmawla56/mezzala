@@ -9,14 +9,16 @@
     "start": "next start",
     "db:setup": "node scripts/db-migrate.mjs && node scripts/db-seed.mjs",
     "check:rls": "node scripts/tenant-leak-check.mjs",
-    "check:all": "node scripts/tenant-leak-check.mjs && node scripts/tagging-check.mjs && node scripts/qa-ai-check.mjs && node scripts/video-check.mjs && node scripts/api-check.mjs",
+    "check:all": "node scripts/tenant-leak-check.mjs && node scripts/tagging-check.mjs && node scripts/qa-ai-check.mjs && node scripts/video-check.mjs && node scripts/api-check.mjs && npx tsc --noEmit && npm run build",
     "test": "vitest run"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1175.0",
+    "@aws-sdk/s3-request-presigner": "^3.1175.0",
     "next": "^15.0.0",
+    "pg": "^8.13.0",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0",
-    "pg": "^8.13.0"
+    "react-dom": "^19.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
